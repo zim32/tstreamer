@@ -36,8 +36,17 @@ public:
         return storage.erase(pos);
     }
 
+    void lock() {
+        mLock.lock();
+    }
+
+    void unlock() {
+        mLock.unlock();
+    }
+
 private:
     size_t piece_size;
+    std::mutex mLock;
 };
 
 

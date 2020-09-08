@@ -5,19 +5,23 @@
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/alert_types.hpp>
 
+#include <fmt/format.h>
+
 #include <iostream>
 #include <memory>
 #include <stdexcept>
-#include <sstream>
+#include <chrono>
+
+using namespace std::chrono_literals;
 
 download_context_t download_ctx;
 
-std::shared_ptr<TStreamer> TStreamer::createFromFileName(const std::string &fileName) {
+std::unique_ptr<TStreamer> TStreamer::createFromFileName(const std::string &fileName) {
     auto t = new TStreamer();
 
     t->mTorrentInfo = std::make_shared<libtorrent::torrent_info>(fileName);
 
-    return std::shared_ptr<TStreamer>(t);
+    return std::unique_ptr<TStreamer>(t);
 }
 
 void TStreamer::dumpFilesInfo() const {
@@ -37,6 +41,17 @@ void TStreamer::start() {
         return;
     }
 
+    if (!mDataCallback) {
+        throw std::logic_error("Can not start. Data callback not provided");
+    }
+
+    if (mMemoryLimit == -1) {
+        this->log("Warning: memory limit is not set. It is advisable to set memory limit. Default is 100BM");
+        mMemoryLimit = 100 * 1024 * 1024;
+    }
+
+    this->log("Starting TStreamer...");
+
     // settings pack
     lt::settings_pack pack;
     pack.set_int(lt::settings_pack::alert_mask, lt::alert::error_notification | lt::alert::piece_progress_notification);
@@ -47,8 +62,7 @@ void TStreamer::start() {
     lt::add_torrent_params atp(temp_storage_constructor);
     atp.save_path = ".";
     atp.ti = mTorrentInfo;
-    atp.flags = lt::torrent_flags::sequential_download | lt::torrent_flags::paused;
-
+    atp.flags = lt::torrent_flags::sequential_download;
 
     // set file priorities
     auto &storage      = mTorrentInfo->files();
@@ -78,13 +92,24 @@ void TStreamer::start() {
     download_ctx.offset_in_first_piece = download_ctx.bytes_offset - download_ctx.start_piece_offset * mTorrentInfo->piece_length();
 
 
+    // init last flush piece
+    mLastFlushedPiece = static_cast<long>(download_ctx.start_piece_offset) - 1;
+
     // add torrent to session
     mTorrentHandle = mSession->add_torrent(atp);
-    mTorrentHandle.pause();
+
     // force to download first piece first
-    mTorrentHandle.set_piece_deadline(download_ctx.start_piece_offset, 5000);
+    this->setAllPiecesPriority(lt::dont_download);
+    mTorrentHandle.set_piece_deadline(download_ctx.start_piece_offset, 1000);
+
+    // set limits
+    mTorrentHandle.set_download_limit(mDownloadLimit);
+    mTorrentHandle.set_upload_limit(mUploadLimit);
 
     mInited = true;
+
+//    this->startServiceLoop();
+    this->startMainLoop();
 }
 
 void TStreamer::setDownloadFileIndex(uint index) {
@@ -96,20 +121,27 @@ void TStreamer::setDownloadFileIndex(uint index) {
 }
 
 void TStreamer::pause() {
-
+    if (mPaused) {
+        return;
+    }
+    mTorrentHandle.pause(lt::torrent_handle::graceful_pause);
+    mPaused = true;
 }
 
 void TStreamer::resume() {
-
+    if (!mPaused) {
+        return;
+    }
+    mTorrentHandle.resume();
+    mPaused = false;
 }
 
 void TStreamer::startMainLoop() {
+    if (!mInited) {
+        throw std::logic_error("Can not start main loop (not inited)");
+    }
 
-    // flush_queue
-    bool flush_started = false;
-    size_t last_flushed_piece = 0;
-    // piece miss map
-    std::map<size_t, uint> piece_misses;
+    this->log("Starting main loop...");
 
     while (true) {
         // process alerts
@@ -124,108 +156,206 @@ void TStreamer::startMainLoop() {
             // piece finished alert
             if (lt::alert_cast<lt::piece_finished_alert>(alert)) {
                 size_t piece_index = (lt::alert_cast<lt::piece_finished_alert>(alert))->piece_index;
+                this->log(fmt::format("Piece finished {}", piece_index));
 
-                // skip if not first piece and flushing not started yet
-                if (
-                        !flush_started &&
-                        piece_index != download_ctx.start_piece_offset
-                        ) {
-                    std::cout << "Wait for first piece to begin flush" << std::endl;
+                if (!this->checkPreBuffer()) {
                     continue;
                 }
 
-                flush_started = true;
-
-                // get piece data from mem_storage
-                auto tmp_storage = dynamic_cast<temp_storage*>(mTorrentHandle.get_storage_impl());
-                const pieces_container::storage_t &pieces_storage = tmp_storage->get_pieces_storage();
-
-                if (pieces_storage.empty()) {
-                    continue;
-                }
-
-                std::cout << "Dump local pieces start" << std::endl;
-                // print available pieces in storage
-                for (const auto &item : pieces_storage) {
-                    std::cout << "Local piece: " << item.first << ". Complete: " << (mTorrentHandle.have_piece(item.first) ? "yes" : "no") << std::endl;
-                }
-                std::cout << "Dump local pieces end" << std::endl;
-
-                auto it = pieces_storage.cbegin();
-
-                while (it != pieces_storage.end()) {
-                    size_t current_piece = it->first;
-
-                    if (current_piece < last_flushed_piece) {
-                        std::cout << "Removing old piece from storage " << current_piece << std::endl;
-                        it = tmp_storage->remove_piece_from_storage(it);
-                        continue;
-                    }
-
-                    if (!(
-                            current_piece == download_ctx.start_piece_offset ||
-                            current_piece == last_flushed_piece + 1
-                    )) {
-                        break;
-                    }
-
-                    if (!mTorrentHandle.have_piece(current_piece)) {
-                        std::cout << "Skipping incomplete piece " << current_piece << std::endl;
-                        piece_misses[current_piece]++;
-
-                        if (piece_misses[current_piece] > 2) {
-                            std::cout << "Set piece deadline " << it->first << std::endl;
-                            mTorrentHandle.set_piece_deadline(current_piece, 5000);
-                            piece_misses[current_piece] = 0;
-                        }
-
-                        break;
-                    }
-
-                    piece_misses.erase(current_piece);
-
-//                    std::ostringstream s;
-//                    s << "Flushing piece " << current_piece << std::endl;
-//                    this->log(s.str());
-
-                    size_t flush_offset;
-                    size_t flush_length;
-
-                    if (
-                            current_piece == download_ctx.start_piece_offset &&
-                            download_ctx.offset_in_first_piece != 0
-                            ) {
-                        flush_offset = download_ctx.offset_in_first_piece;
-                        flush_length = it->second.size() - download_ctx.offset_in_first_piece;
-                    } else {
-                        flush_offset = 0;
-                        flush_length = it->second.size();
-                    }
-
-//                    outfile.write(it->second.data() + flush_offset, flush_length);
-//                    outfile.flush();
-//                    std::cerr.write(it->second.data() + flush_offset, flush_length);
-//                    std::cerr.flush();
-
-                    if (mDataCallback) {
-                        mDataCallback(it->second.data() + flush_offset, flush_length);
-                    }
-
-                    last_flushed_piece = current_piece;
-
-                    it = tmp_storage->remove_piece_from_storage(it);
-                }
+                this->flushPieces();
             }
         }
+
+        this->flushPieces();
+
+        // break main loop if last piece was flushed
+        if (mLastFlushedPiece == download_ctx.end_piece_offset) {
+            return;
+        }
+
+        // all alerts processed, sleep for some time
+        std::this_thread::sleep_for(1s);
     }
 }
 
 void TStreamer::shutdown() {
-
+    mSession->abort();
 }
 
 void TStreamer::log(const std::string& message) const {
     if (mLogCallback) {
         mLogCallback(message);
+    }
+}
+
+size_t TStreamer::getMemoryUsed() const {
+    auto tmp_storage = dynamic_cast<temp_storage*>(mTorrentHandle.get_storage_impl());
+    const pieces_container::storage_t &pieces_storage = tmp_storage->get_pieces_storage();
+
+    return mTorrentInfo->piece_length() * pieces_storage.size();
+}
+
+const download_context_t& TStreamer::getDownloadContext() const {
+    return download_ctx;
+}
+
+void TStreamer::setDownloadLimit(int limit) {
+    if (mInited) {
+        mTorrentHandle.set_download_limit(limit);
+    }
+
+    mDownloadLimit = limit;
+}
+
+void TStreamer::setUploadLimit(int limit) {
+    if (mInited) {
+        mTorrentHandle.set_upload_limit(limit);
+    }
+
+    mUploadLimit = limit;
+}
+
+lt::torrent_status TStreamer::getTorrentStatus() const {
+    return mTorrentHandle.status();
+}
+
+void TStreamer::setAllPiecesPriority(lt::download_priority_t priority) {
+    for (lt::piece_index_t x = 0; x <= mTorrentInfo->last_piece(); x++) {
+        mTorrentHandle.piece_priority(x, priority);
+    }
+}
+
+void TStreamer::setMemoryLimit(int limit) {
+    this->mMemoryLimit = limit;
+}
+
+void TStreamer::dumpPiecesInfo() {
+    auto const tmpStorage = dynamic_cast<temp_storage*>(mTorrentHandle.get_storage_impl());
+    const auto &piecesStorage = tmpStorage->get_pieces_storage();
+
+    std::cout << "====== Dump local pieces ======" << std::endl;
+
+    for (const auto &item : piecesStorage) {
+        std::cout << "Local piece: " << item.first << ". Complete: " << (mTorrentHandle.have_piece(item.first) ? "yes" : "no") << std::endl;
+    }
+
+    std::cout << "================================" << std::endl;
+}
+
+bool TStreamer::checkPreBuffer() const {
+    if (mLastFlushedPiece >= 0) {
+        return true;
+    }
+
+    auto left = mPiecesToPreBuffer;
+
+    for (auto x = download_ctx.start_piece_offset; x <= download_ctx.end_piece_offset; x++) {
+        if (left <= 0) {
+            return true;
+        }
+
+        if (mTorrentHandle.have_piece(x)) {
+            left--;
+        } else {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+void TStreamer::setPiecesToPreBuffer(uint pieces) {
+    if (mInited) {
+        throw std::logic_error("Can not call setPiecesToPreBuffer after init");
+    }
+
+    mPiecesToPreBuffer = pieces;
+}
+
+void TStreamer::flushPieces() {
+    // piece miss map
+    static std::map<size_t, uint> piece_misses;
+
+    // get piece data from mem_storage
+    auto tmp_storage = dynamic_cast<temp_storage*>(mTorrentHandle.get_storage_impl());
+    const pieces_container::storage_t &pieces_storage = tmp_storage->get_pieces_storage();
+
+    if (pieces_storage.empty()) {
+        return;
+    }
+
+    auto it = pieces_storage.cbegin();
+
+    while (true) {
+        if (it == pieces_storage.cend()) {
+            break;;
+        }
+
+        size_t current_piece = it->first;
+        auto neededPiece = mLastFlushedPiece + 1;
+
+        // skip flushed pieces
+        if (current_piece < neededPiece) {
+            it++;
+            continue;
+        }
+
+        // skip future piece
+        if (current_piece != neededPiece) {
+            break;
+        }
+
+        // check piece is complete
+        if (!mTorrentHandle.have_piece(neededPiece)) {
+            this->log(fmt::format("Skipping incomplete piece {}", neededPiece));
+            break;
+        }
+
+        piece_misses.erase(current_piece);
+
+        size_t flush_offset;
+        size_t flush_length;
+
+        if (
+                current_piece == download_ctx.start_piece_offset &&
+                download_ctx.offset_in_first_piece != 0
+                ) {
+            flush_offset = download_ctx.offset_in_first_piece;
+            flush_length = it->second.size() - download_ctx.offset_in_first_piece;
+        } else {
+            flush_offset = 0;
+            flush_length = it->second.size();
+        }
+
+        if (mDataCallback) {
+            this->log(fmt::format("Flushing piece {} ...", current_piece));
+            // this potentially could block for a long time
+            mDataCallback(it->second.data() + flush_offset, flush_length);
+            this->log(fmt::format("Flushing of piece {} done", current_piece));
+        }
+
+        mLastFlushedPiece = current_piece;
+
+        it = tmp_storage->remove_piece_from_storage(it);
+        this->log(fmt::format("Piece {} removed from storage", current_piece));
+
+        this->requestPieces();
+    }
+}
+
+void TStreamer::requestPieces() {
+    // request pieces upfront
+    auto neededPiece = mLastFlushedPiece + 1;
+    auto piecesToRequest = mMemoryLimit / download_ctx.piece_size;
+
+    if (neededPiece > 0) {
+        for (auto x = neededPiece; x <= neededPiece + piecesToRequest; x++) {
+            if (mTorrentHandle.piece_priority(x) != lt::dont_download) {
+                continue;
+            }
+            this->log(fmt::format("Requesting piece {} ...", x));
+            mTorrentHandle.set_piece_deadline(x, 1000 + x);
+            mTorrentHandle.piece_priority(x, lt::default_priority);
+        }
     }
 }

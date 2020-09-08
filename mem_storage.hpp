@@ -20,7 +20,6 @@ extern download_context_t download_ctx;
 struct temp_storage:  lt::storage_interface
 {
     pieces_container m_pieces{download_ctx.piece_size};
-    std::mutex m_write_lock;
 
     explicit temp_storage(lt::file_storage const& fs) : lt::storage_interface(fs) {}
     void initialize(lt::storage_error&) override {}
@@ -45,7 +44,7 @@ struct temp_storage:  lt::storage_interface
     }
 
     int writev(lt::span<lt::iovec_t const> bufs, lt::piece_index_t const piece, int offset, lt::open_mode_t, lt::storage_error&) override {
-        m_write_lock.lock();
+        m_pieces.lock();
 
         if (piece < download_ctx.start_piece_offset || piece > download_ctx.end_piece_offset) {
             std::cout << "Mem storage: Piece " << piece << "is out of range. Ignoring" << std::endl;
@@ -65,7 +64,7 @@ struct temp_storage:  lt::storage_interface
 
 //        std::cout << "Wrote " << wrote_bytes << " bytes" << std::endl;
 
-        m_write_lock.unlock();
+        m_pieces.unlock();
 
         return wrote_bytes;
     }
@@ -100,10 +99,14 @@ public:
     }
 
     pieces_container::storage_t::const_iterator remove_piece_from_storage(pieces_container::storage_t::const_iterator pos) {
-        m_write_lock.lock();
+        m_pieces.lock();
         auto result = m_pieces.remove_piece_data(pos);
-        m_write_lock.unlock();
+        m_pieces.unlock();
         return result;
+    }
+
+    bool have_piece(size_t piece_index) {
+        return m_pieces.storage.find(piece_index) != m_pieces.storage.end();
     }
 };
 
